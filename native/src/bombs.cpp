@@ -6,6 +6,7 @@
 
 #include "MinHook.h"
 #include "log.h"
+#include "shots.h"
 
 namespace coop::bombs {
 
@@ -84,6 +85,13 @@ void __cdecl DestroyHook(yyc::CInstance* self, yyc::CInstance* other) {
 }
 
 // The step also grows, fades and ends the blast: it runs, with the damage marked as dealt already.
+bool DealtDamage(int id) {
+    yyc::RValue dealt{};
+    const bool done = yyc::GetVar(id, kSlotDealtDmg, &dealt) && yyc::IsNumber(dealt) && yyc::ToReal(dealt) != 0;
+    yyc::Free(&dealt);
+    return done;
+}
+
 void __cdecl ExplosionStepHook(yyc::CInstance* self, yyc::CInstance* other) {
     const int id = IdOf(self);
     if (g_harmless.count(id) > 0) {
@@ -91,8 +99,13 @@ void __cdecl ExplosionStepHook(yyc::CInstance* self, yyc::CInstance* other) {
         yyc::SetVar(id, kSlotDealtDmg, &dealt);
         yyc::SetVar(id, kSlotDmg, &none);
         yyc::SetVar(id, kSlotDmgPlayer, &none2);
+        g_origExplosionStep(self, other);
+        return;
     }
+    const bool before = !net::IsConnected() || DealtDamage(id);
     g_origExplosionStep(self, other);
+    // A real blast's step hurts what it touches once - and sets it on fire (`burn`): the others' copies burn too.
+    if (!before && yyc::FindInstance(id) == self && DealtDamage(id)) shots::AfterBlast(self);
 }
 
 void Place(yyc::CInstance* self, const BombMsg& msg) {
