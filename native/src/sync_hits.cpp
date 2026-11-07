@@ -98,8 +98,13 @@ void ApplyHp(yyc::CInstance* self, const HpMsg& msg) {
     if (IsHost() && !IsSynced(self, msg.object)) return;  // a guest repairs world objects only
     const int local = Resolve(self, msg.id, msg.object, msg.x, msg.y);
     if (local == 0) return;
+    // The host decides when a world object breaks (its destroy comes as kDestroy). A hit or a blast leaves the host's
+    // object at 0 a step before it goes; sent then, a guest's copy broke first: its own Destroy dropped the loot for the
+    // guest, and its report made the host remove its object without any (the host hit, the guest got the drop).
+    constexpr float kAlive = 0.001f;
+    const float hp = IsGuest() && msg.hp < kAlive ? kAlive : msg.hp;
     const int slots[4] = {kSlotHp, kSlotHpAlpha, kSlotHpLast, kSlotHpWhite};
-    const float values[4] = {msg.hp, msg.alpha, msg.last, msg.white};
+    const float values[4] = {hp, msg.alpha, msg.last, msg.white};
     for (int i = 0; i < 4; ++i) {
         yyc::RValue v = yyc::Real(values[i]);
         yyc::SetVar(local, slots[i], &v);

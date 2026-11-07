@@ -291,6 +291,9 @@ void __cdecl ObjectStepHook(yyc::CInstance* self, yyc::CInstance* other) {
     const int id = found->second;
     bool ok = false;
     const double hp = yyc::FindInstance(id) == self ? ReadReal(id, kSlotHp, &ok) : 0;
+    // Padded for the step, as a dry hit does: the fire's 0.02 must not break it here (the host decides that).
+    constexpr double kPadding = 1e6;
+    if (ok) WriteReal(id, kSlotHp, hp + kPadding);
     g_origObjectStep(self, other);
     if (yyc::FindInstance(id) != self) {
         g_burningCopies.erase(self);
