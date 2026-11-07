@@ -305,6 +305,7 @@ constexpr uint8_t kSharedTypes[] = {
     57,  // displays: what a display case shows
     58,  // shots: an arrow or fireball fired
     59,  // shots: a fireball went off
+    61,  // shots: world objects a blast set on fire
     70,  // unlocks
     90,  // progress: museum lists
     91,  // quests

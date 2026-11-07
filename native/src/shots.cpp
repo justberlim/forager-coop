@@ -9,6 +9,7 @@
 #include "bombs.h"
 #include "log.h"
 #include "puppet.h"
+#include "sync.h"
 
 namespace coop::shots {
 
@@ -16,6 +17,7 @@ namespace {
 
 constexpr uint8_t kShot = 58;   // either way (the host passes a guest's on): ShotMsg
 constexpr uint8_t kBlast = 59;  // either way: BlastMsg, a fireball went off (ExplosionCreate in its collision)
+constexpr uint8_t kBurn = 61;   // either way: BurnEntry list, world objects a blast set on fire
 constexpr int kObjArrow = 303, kObjFireball = 301;  // decompiled/data/objects.tsv
 // decompiled/code/yyvar_map.tsv
 constexpr uint32_t kYYVarDirection = 0x01AD87A0, kYYVarSpeed = 0x01AD8C10, kYYVarImageAngle = 0x01AD8728;
@@ -29,6 +31,13 @@ constexpr uint32_t kScriptExplosionCreate = 0x0086D1E0;
 constexpr int kBlastArgs = 4;
 constexpr int kObjExplosion = 295;   // decompiled/data/objects.tsv
 constexpr int kSlotRange = 0x744;    // objExplosion.range: ExplosionCreate's third argument
+// parObject.burn: set by a blast (objExplosion Step_0); while it is on, parObject Step_0 takes 0.02 hp a step and
+// draws the fire (FireEffect). A blast copy is harmless (it sets nothing on fire), and an object's health goes to the
+// others only on tool hits: the other players saw no fire and no health going down, only the object vanish.
+constexpr int kSlotBurn = 0xD7;
+constexpr int kBurnParents[] = {80, 81};  // parObject, parHerb (decompiled/data/objects.tsv)
+constexpr double kBurnMargin = 16;        // past the blast's range: what its edge reached
+constexpr size_t kMaxBurns = 64;
 constexpr float kBlastMatchDistance = 48;  // a copy flies a little behind its fireball: the one that went off
 
 // What a copy must not do (decompiled/code/index.tsv): hit (the collision events deal the damage) and, for an arrow,
@@ -47,6 +56,12 @@ struct ShotMsg {
     float direction, speed, angle;
     float xscale, yscale;
     float sprite;
+};
+struct BurnEntry {
+    int32_t hostId;  // the host's id of it (sync::HostIdOf), found with its spot at the others (sync::Resolve)
+    int32_t object;
+    float x, y;
+    float burn;
 };
 struct BlastMsg {
     float args[kBlastArgs];  // ExplosionCreate's: x, y, range, dmgPlayer
@@ -193,6 +208,65 @@ void ShowBlast(yyc::CInstance* self, const BlastMsg& msg) {
 
 }  // namespace
 
+namespace {
+
+double ReadReal(int id, int slot, bool* ok) {
+    yyc::RValue value{};
+    *ok = yyc::GetVar(id, slot, &value) && yyc::IsNumber(value);
+    const double result = *ok ? yyc::ToReal(value) : 0;
+    yyc::Free(&value);
+    return result;
+}
+
+void ApplyBurns(yyc::CInstance* self, const net::Message& message) {
+    const size_t count = message.payload.size() / sizeof(BurnEntry);
+    if (message.payload.size() % sizeof(BurnEntry) != 0 || count > kMaxBurns) return;
+    for (size_t i = 0; i < count; ++i) {
+        BurnEntry entry{};
+        memcpy(&entry, message.payload.data() + i * sizeof(entry), sizeof(entry));
+        if (!std::isfinite(entry.x) || !std::isfinite(entry.y) || !std::isfinite(entry.burn)) continue;
+        const int local = sync::Resolve(self, entry.hostId, entry.object, entry.x, entry.y);
+        bool ok = false;
+        ReadReal(local, kSlotBurn, &ok);
+        if (local == 0 || !ok) continue;  // never turn a string (or nothing) into a number
+        yyc::RValue burn = yyc::Real(entry.burn);
+        yyc::SetVar(local, kSlotBurn, &burn);
+    }
+}
+
+}  // namespace
+
+void AfterBlast(yyc::CInstance* explosion) {
+    if (explosion == nullptr || !net::IsConnected()) return;
+    const int blastId = IdOf(explosion);
+    bool ok = false;
+    const double range = ReadReal(blastId, kSlotRange, &ok);
+    if (!ok) return;
+    const double bx = yyc::GetBuiltinReal(explosion, yyc::va::YYVar_x);
+    const double by = yyc::GetBuiltinReal(explosion, yyc::va::YYVar_y);
+    const double reach = (range + kBurnMargin) * (range + kBurnMargin);
+    std::vector<BurnEntry> burns;
+    for (const int parent : kBurnParents) {
+        const int count = static_cast<int>(yyc::CallReal(explosion, "instance_number", {double(parent)}));
+        for (int i = 0; i < count && burns.size() < kMaxBurns; ++i) {
+            const int id = static_cast<int>(yyc::CallReal(explosion, "instance_find", {double(parent), double(i)}));
+            yyc::CInstance* target = yyc::FindInstance(id);
+            if (target == nullptr) continue;
+            const double x = yyc::GetBuiltinReal(target, yyc::va::YYVar_x);
+            const double y = yyc::GetBuiltinReal(target, yyc::va::YYVar_y);
+            if ((x - bx) * (x - bx) + (y - by) * (y - by) > reach) continue;
+            const double burn = ReadReal(id, kSlotBurn, &ok);
+            if (!ok || burn <= 0) continue;
+            const int object = static_cast<int>(yyc::GetBuiltinReal(target, yyc::va::YYVar_object_index));
+            burns.push_back({sync::HostIdOf(id), object, static_cast<float>(x), static_cast<float>(y),
+                             static_cast<float>(burn)});
+        }
+    }
+    if (burns.empty()) return;
+    net::Send(kBurn, burns.data(), burns.size() * sizeof(BurnEntry));
+    Log("shots: a blast set %u objects on fire - sent", static_cast<unsigned>(burns.size()));
+}
+
 bool InstallHooks() {
     bool ok = true;
     for (size_t i = 0; i < kHookCount; ++i) {
@@ -224,6 +298,10 @@ void Tick() {
 }
 
 bool Handle(const net::Message& message, yyc::CInstance* localPlayer) {
+    if (message.type == kBurn) {
+        ApplyBurns(localPlayer, message);
+        return true;
+    }
     if (message.type == kBlast) {
         if (message.payload.size() != sizeof(BlastMsg)) return true;
         BlastMsg msg{};
