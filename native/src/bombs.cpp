@@ -6,6 +6,7 @@
 
 #include "MinHook.h"
 #include "log.h"
+#include "puppet.h"
 #include "shots.h"
 
 namespace coop::bombs {
@@ -103,7 +104,12 @@ void __cdecl ExplosionStepHook(yyc::CInstance* self, yyc::CInstance* other) {
         return;
     }
     const bool before = !net::IsConnected() || DealtDamage(id);
+    // The host's copy of a guest's fireball blast is the real one: it hurts as that guest (PlayerFind = its puppet).
+    net::PeerId owner = net::kHostPeer;
+    const bool guests = shots::BlastOwner(id, &owner);
+    if (guests) puppet::BeginActing(owner);
     g_origExplosionStep(self, other);
+    if (guests) puppet::EndActing();
     // A real blast's step hurts what it touches once - and sets it on fire (`burn`): the others' copies burn too.
     if (!before && yyc::FindInstance(id) == self && DealtDamage(id)) shots::AfterBlast(self);
 }

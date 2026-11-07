@@ -68,6 +68,13 @@ int HostIdOf(int localId);
 // 0 if there is none.
 int Resolve(yyc::CInstance* self, int hostId, int object, double x, double y);
 
+bool IsHost();
+bool IsGuest();
+// Host: sends world object `target`'s health (its health bar) to the guests, as after a hit, without showing a hit.
+void SendObjectHp(yyc::CInstance* target);
+// Host: what destroying instance `id` gives (drops, XP) goes to `player` (a guest), or to the host itself.
+void NoteHitter(int id, net::PeerId player);
+
 // After a fault caught mid-change (__except): the "carrying out a peer's change" counters are left raised by the
 // skipped decrements, and while raised no change of ours is reported. Puts them back to zero.
 void ResetTransient();

@@ -18,9 +18,14 @@ void OnCreated(yyc::CInstance* self, int createdId, int object);
 // fly: their direction and speed are set).
 void Tick();
 
-// bombs.cpp: a real objExplosion here has just dealt its damage. What it set on fire (`burn`, the void sword's
-// fireballs) goes to the others, whose copies burn too: the fire shows and the health goes down there as well.
+// Host, from bombs.cpp: a real objExplosion here has just dealt its damage. What it hurt goes to the guests with its
+// health, and what it set on fire (`burn`, the void/nuclear sword's fireballs) burns there too - shown only: the
+// guests' copies follow the host's health while they burn.
 void AfterBlast(yyc::CInstance* explosion);
+
+// Host: explosion `explosionId` is the real one of a guest's fireball blast (made from its message): `owner` is that
+// guest. Its step runs as the guest.
+bool BlastOwner(int explosionId, net::PeerId* owner);
 
 // Game thread: applies a shot message; false if `message` is not one.
 bool Handle(const net::Message& message, yyc::CInstance* localPlayer);

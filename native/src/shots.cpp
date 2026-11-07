@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -38,6 +39,9 @@ constexpr int kSlotBurn = 0xD7;
 constexpr int kBurnParents[] = {80, 81};  // parObject, parHerb (decompiled/data/objects.tsv)
 constexpr double kBurnMargin = 16;        // past the blast's range: what its edge reached
 constexpr size_t kMaxBurns = 64;
+constexpr unsigned kBurnUpdateSteps = 10;  // host: a burning object's health to the guests, 6 times a second
+constexpr int kSlotHp = 0x573, kSlotHpMax = 0x576, kSlotDmg = 0x197, kSlotDmgPlayer = 0x198;
+constexpr uint32_t kObjectStep = 0x00B5CF40;  // parObject Step_0 (children call it as their inherited step)
 constexpr float kBlastMatchDistance = 48;  // a copy flies a little behind its fireball: the one that went off
 
 // What a copy must not do (decompiled/code/index.tsv): hit (the collision events deal the damage) and, for an arrow,
@@ -66,6 +70,7 @@ struct BurnEntry {
 struct BlastMsg {
     float args[kBlastArgs];  // ExplosionCreate's: x, y, range, dmgPlayer
     float depth;
+    float dmg;  // the shooter's blast damage (objExplosion.dmg), 0 if unknown
 };
 #pragma pack(pop)
 
@@ -151,26 +156,66 @@ void Show(yyc::CInstance* self, net::PeerId from, const ShotMsg& msg) {
     }
 }
 
+// The host decides what a fireball's blast does, as it decides every world object's health:
+//  - a guest's own blast is harmless at the guest (only shown); the host makes the real one, as the guest's (what it
+//    breaks drops for the guest), from the blast message;
+//  - the host's blast is real at the host and harmless at the guests;
+//  - what a real blast hurts and sets on fire (`burn`): its health goes to the guests at once, and while it burns, every
+//    few steps; at a guest a burning copy shows the fire but loses no health of its own (parObject Step_0's 0.02 a
+//    step), so it never breaks before the host's - the guest's copy broke first and the drop went to the guest, even
+//    for the host's own hit.
+// Before, each blast was real at its shooter only: the health of the same tree differed between the players.
+
+bool g_makingOwnBlast = false;  // guest: inside our fireball's ExplosionCreate (its objExplosion: harmless here)
+int g_ownBlastId = 0;
+std::unordered_map<int, net::PeerId> g_blastOwners;  // host: a guest's blast made here -> that guest
+std::unordered_set<int> g_burningAtHost;            // host: world objects a real blast set on fire
+std::unordered_map<yyc::CInstance*, int> g_burningCopies;  // guest: copies burning (instance -> id)
+unsigned g_ticks = 0;
+yyc::EventFn g_origObjectStep = nullptr;
+
+double ReadReal(int id, int slot, bool* ok) {
+    yyc::RValue value{};
+    *ok = yyc::GetVar(id, slot, &value) && yyc::IsNumber(value);
+    const double result = *ok ? yyc::ToReal(value) : 0;
+    yyc::Free(&value);
+    return result;
+}
+
+void WriteReal(int id, int slot, double value) {
+    yyc::RValue v = yyc::Real(value);
+    yyc::SetVar(id, slot, &v);
+}
+
 // One of our own fireballs went off: the others see its blast too (and lose their copy of it there).
 yyc::RValue* __cdecl ExplosionCreateHook(yyc::CInstance* self, yyc::CInstance* other, yyc::RValue* result, int argc,
                                          yyc::RValue** args) {
+    const bool ours = self != nullptr && net::IsConnected() && argc >= 2 && args != nullptr &&
+                      static_cast<int>(yyc::GetBuiltinReal(self, yyc::va::YYVar_object_index)) == kObjFireball &&
+                      g_copies.count(IdOf(self)) == 0;  // a copy never collides; to be safe all the same
+    if (!ours) return g_origExplosionCreate(self, other, result, argc, args);
+    const bool guest = sync::IsGuest();
+    g_makingOwnBlast = guest;
+    g_ownBlastId = 0;
     yyc::RValue* r = g_origExplosionCreate(self, other, result, argc, args);
-    if (self == nullptr || !net::IsConnected() || argc < 2 || args == nullptr) return r;
-    if (static_cast<int>(yyc::GetBuiltinReal(self, yyc::va::YYVar_object_index)) != kObjFireball) return r;
-    if (g_copies.count(IdOf(self)) > 0) return r;  // a copy never collides; to be safe all the same
+    g_makingOwnBlast = false;
     BlastMsg msg{};
     for (int i = 0; i < kBlastArgs; ++i) {
         const yyc::RValue* a = i < argc ? args[i] : nullptr;
         msg.args[i] = a != nullptr && yyc::IsNumber(*a) ? static_cast<float>(yyc::ToReal(*a)) : 0.f;
     }
     msg.depth = static_cast<float>(yyc::GetBuiltinReal(self, yyc::va::YYVar_depth));
+    bool ok = false;
+    // The explosion takes its damage from its maker (objExplosion Create_0): the host's copy of a guest's blast needs
+    // the guest's, not the host's.
+    if (g_ownBlastId != 0) msg.dmg = static_cast<float>(ReadReal(g_ownBlastId, kSlotDmg, &ok));
     net::Send(kBlast, &msg, sizeof(msg));
     return r;
 }
 
-// Another player's fireball went off: its copy here (the nearest) goes, and the same blast shows - harmless: it is
-// the shooter's blast that breaks and hurts, at the shooter's side (bombs.cpp makes it so).
-void ShowBlast(yyc::CInstance* self, const BlastMsg& msg) {
+// Another player's fireball went off: its copy here (the nearest) goes, and the same blast shows - at a guest
+// harmless (bombs.cpp makes it so), at the host the real one of a guest's blast.
+void ShowBlast(yyc::CInstance* self, net::PeerId from, const BlastMsg& msg) {
     const float x = msg.args[0], y = msg.args[1];
     int nearest = 0;
     double best = double(kBlastMatchDistance) * kBlastMatchDistance;
@@ -194,31 +239,28 @@ void ShowBlast(yyc::CInstance* self, const BlastMsg& msg) {
         yyc::CallReal(self, "instance_destroy", {double(nearest), 0});
     }
     // Made as ExplosionCreate makes it, but here: ExplosionCreate returns nothing, so its blast could not be told
-    // apart and made harmless - the copy hurt objects, mobs and players a second time (review of PR #4). As
-    // bombs::Blast does: the explosion directly, its range set, harmless before its first step.
+    // apart (review of PR #4). As bombs::Blast does: the explosion directly, its range set.
     ++g_showing;
     const int blast = static_cast<int>(
         yyc::CallReal(self, "instance_create_depth", {double(x), double(y), double(msg.depth), double(kObjExplosion)}));
     --g_showing;
     if (yyc::FindInstance(blast) == nullptr) return;
-    bombs::MakeHarmless(blast);
-    yyc::RValue range = yyc::Real(msg.args[2]);
-    yyc::SetVar(blast, kSlotRange, &range);  // dmgPlayer is not needed: the harmless step zeroes dmg and dmgPlayer
-}
-
-}  // namespace
-
-namespace {
-
-double ReadReal(int id, int slot, bool* ok) {
-    yyc::RValue value{};
-    *ok = yyc::GetVar(id, slot, &value) && yyc::IsNumber(value);
-    const double result = *ok ? yyc::ToReal(value) : 0;
-    yyc::Free(&value);
-    return result;
+    WriteReal(blast, kSlotRange, msg.args[2]);
+    if (sync::IsHost() && from != net::kHostPeer) {
+        // A guest's blast: the real one is ours, with the guest's damage, and what it breaks is the guest's.
+        if (msg.dmg > 0) WriteReal(blast, kSlotDmg, msg.dmg);
+        WriteReal(blast, kSlotDmgPlayer, msg.args[3]);
+        g_blastOwners[blast] = from;
+        for (auto it = g_blastOwners.begin(); it != g_blastOwners.end();) {
+            it = yyc::FindInstance(it->first) == nullptr ? g_blastOwners.erase(it) : std::next(it);
+        }
+        return;
+    }
+    bombs::MakeHarmless(blast);  // the harmless step zeroes dmg and dmgPlayer
 }
 
 void ApplyBurns(yyc::CInstance* self, const net::Message& message) {
+    if (!sync::IsGuest()) return;  // the host's world objects burn from its own blasts only
     const size_t count = message.payload.size() / sizeof(BurnEntry);
     if (message.payload.size() % sizeof(BurnEntry) != 0 || count > kMaxBurns) return;
     for (size_t i = 0; i < count; ++i) {
@@ -228,17 +270,50 @@ void ApplyBurns(yyc::CInstance* self, const net::Message& message) {
         const int local = sync::Resolve(self, entry.hostId, entry.object, entry.x, entry.y);
         bool ok = false;
         ReadReal(local, kSlotBurn, &ok);
-        if (local == 0 || !ok) continue;  // never turn a string (or nothing) into a number
-        yyc::RValue burn = yyc::Real(entry.burn);
-        yyc::SetVar(local, kSlotBurn, &burn);
+        yyc::CInstance* copy = local != 0 ? yyc::FindInstance(local) : nullptr;
+        if (copy == nullptr || !ok) continue;  // never turn a string (or nothing) into a number
+        WriteReal(local, kSlotBurn, entry.burn);
+        g_burningCopies[copy] = local;
     }
+}
+
+// Guest: a burning copy's step shows the fire, but its health is the host's (it comes with the host's updates).
+void __cdecl ObjectStepHook(yyc::CInstance* self, yyc::CInstance* other) {
+    if (g_burningCopies.empty()) {
+        g_origObjectStep(self, other);
+        return;
+    }
+    const auto found = g_burningCopies.find(self);
+    if (found == g_burningCopies.end()) {
+        g_origObjectStep(self, other);
+        return;
+    }
+    const int id = found->second;
+    bool ok = false;
+    const double hp = yyc::FindInstance(id) == self ? ReadReal(id, kSlotHp, &ok) : 0;
+    g_origObjectStep(self, other);
+    if (yyc::FindInstance(id) != self) {
+        g_burningCopies.erase(self);
+        return;
+    }
+    if (ok) WriteReal(id, kSlotHp, hp);
+    if (ReadReal(id, kSlotBurn, &ok) <= 0 || !ok) g_burningCopies.erase(self);
 }
 
 }  // namespace
 
+bool BlastOwner(int explosionId, net::PeerId* owner) {
+    const auto found = g_blastOwners.find(explosionId);
+    if (found == g_blastOwners.end()) return false;
+    *owner = found->second;
+    return true;
+}
+
 void AfterBlast(yyc::CInstance* explosion) {
-    if (explosion == nullptr || !net::IsConnected()) return;
+    if (explosion == nullptr || !net::IsConnected() || !sync::IsHost()) return;
     const int blastId = IdOf(explosion);
+    net::PeerId owner = net::kHostPeer;
+    BlastOwner(blastId, &owner);
     bool ok = false;
     const double range = ReadReal(blastId, kSlotRange, &ok);
     if (!ok) return;
@@ -255,11 +330,17 @@ void AfterBlast(yyc::CInstance* explosion) {
             const double x = yyc::GetBuiltinReal(target, yyc::va::YYVar_x);
             const double y = yyc::GetBuiltinReal(target, yyc::va::YYVar_y);
             if ((x - bx) * (x - bx) + (y - by) * (y - by) > reach) continue;
+            const double hp = ReadReal(id, kSlotHp, &ok);
+            const double hpMax = ok ? ReadReal(id, kSlotHpMax, &ok) : 0;
             const double burn = ReadReal(id, kSlotBurn, &ok);
-            if (!ok || burn <= 0) continue;
+            const bool burning = ok && burn > 0;
+            if (!burning && !(hp < hpMax)) continue;  // the blast did nothing to it
+            sync::NoteHitter(id, owner);   // what breaking it gives goes to the blast's shooter
+            sync::SendObjectHp(target);    // the blast's damage, at the guests too
+            if (!burning) continue;
+            g_burningAtHost.insert(id);
             const int object = static_cast<int>(yyc::GetBuiltinReal(target, yyc::va::YYVar_object_index));
-            burns.push_back({sync::HostIdOf(id), object, static_cast<float>(x), static_cast<float>(y),
-                             static_cast<float>(burn)});
+            burns.push_back({id, object, static_cast<float>(x), static_cast<float>(y), static_cast<float>(burn)});
         }
     }
     if (burns.empty()) return;
@@ -275,16 +356,36 @@ bool InstallHooks() {
     }
     ok = MH_CreateHook(yyc::At<void*>(kScriptExplosionCreate), reinterpret_cast<void*>(&ExplosionCreateHook),
                        reinterpret_cast<void**>(&g_origExplosionCreate)) == MH_OK && ok;
+    ok = MH_CreateHook(yyc::At<void*>(kObjectStep), reinterpret_cast<void*>(&ObjectStepHook),
+                       reinterpret_cast<void**>(&g_origObjectStep)) == MH_OK && ok;
     if (!ok) Log("shots: hooks failed");
     return ok;
 }
 
 void OnCreated(yyc::CInstance* self, int createdId, int object) {
+    if (g_makingOwnBlast && object == kObjExplosion) {  // a guest's own blast: shown only, the host's is real
+        g_ownBlastId = createdId;
+        bombs::MakeHarmless(createdId);
+        return;
+    }
     if (!IsShot(object) || g_showing > 0 || !net::IsConnected() || !FiredByLocalPlayer(self)) return;
     g_fired.push_back(createdId);
 }
 
 void Tick() {
+    // Host: what burns loses health every step; the guests' copies follow it.
+    if (!g_burningAtHost.empty() && ++g_ticks % kBurnUpdateSteps == 0) {
+        for (auto it = g_burningAtHost.begin(); it != g_burningAtHost.end();) {
+            yyc::CInstance* target = yyc::FindInstance(*it);
+            if (target == nullptr) {
+                it = g_burningAtHost.erase(it);
+                continue;
+            }
+            sync::SendObjectHp(target);
+            bool ok = false;
+            it = ReadReal(*it, kSlotBurn, &ok) > 0 && ok ? std::next(it) : g_burningAtHost.erase(it);
+        }
+    }
     if (g_fired.empty()) return;
     for (const int id : g_fired) {
         yyc::CInstance* shot = yyc::FindInstance(id);
@@ -309,8 +410,8 @@ bool Handle(const net::Message& message, yyc::CInstance* localPlayer) {
         for (const float v : msg.args) {
             if (!std::isfinite(v)) return true;
         }
-        if (!std::isfinite(msg.depth)) return true;
-        ShowBlast(localPlayer, msg);
+        if (!std::isfinite(msg.depth) || !std::isfinite(msg.dmg)) return true;
+        ShowBlast(localPlayer, message.from, msg);
         return true;
     }
     if (message.type != kShot) return false;
@@ -326,6 +427,10 @@ void Reset() {
     g_fired.clear();
     g_copies.clear();
     g_showing = 0;
+    g_makingOwnBlast = false;
+    g_blastOwners.clear();
+    g_burningAtHost.clear();
+    g_burningCopies.clear();
 }
 
 }  // namespace coop::shots

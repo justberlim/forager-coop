@@ -291,6 +291,17 @@ bool TakeGuestHitter(int id, net::PeerId* guest) {
 
 void ForgetHits() { g_hitByGuest.clear(); }
 
+void SendObjectHp(yyc::CInstance* target) { SendHp(target, kNoHitter); }
+
+void NoteHitter(int id, net::PeerId player) {
+    if (!IsHost()) return;
+    if (player == net::kHostPeer) {
+        g_hitByGuest.erase(id);
+    } else {
+        g_hitByGuest[id] = player;
+    }
+}
+
 void SendDamage(int localId, float amount) {
     yyc::CInstance* target = yyc::FindInstance(localId);
     const int hostId = HostIdOf(localId);
