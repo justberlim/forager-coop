@@ -913,6 +913,7 @@ void Tick(yyc::CInstance* localPlayer) {
     if (IsGuest()) CollectCrafted(localPlayer);
     if (IsGuest()) SendScrollSpawners();
     if (IsGuest()) SendBuiltStructures();
+    WatchHits(localPlayer);
     if (++g_steps % kStatsEverySteps == 0) {
         Log("sync: sent spawn %u destroy %u hit %u gone %u | applied spawn %u destroy %u hit %u gone %u",
             g_sent[kSpawn], g_sent[kDestroy], g_sent[kHit], g_sent[kGuestDestroyed], g_applied[kSpawn],

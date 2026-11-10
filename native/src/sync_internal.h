@@ -83,6 +83,7 @@ bool Hook(uint32_t va, void* detour, void* original);
 // sync_hits.cpp
 bool InstallHitHooks();
 bool HandleHits(const net::Message& message, yyc::CInstance* localPlayer);  // false: not a hit or health message
+void WatchHits(yyc::CInstance* localPlayer);  // every local player step: damage that is no tool hit (sync_hits.cpp)
 // Host: the guest whose hit was the last on instance `id` (it gets what destroying it gives); forgotten here.
 bool TakeGuestHitter(int id, net::PeerId* guest);
 void ForgetHits();

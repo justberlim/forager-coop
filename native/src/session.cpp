@@ -64,7 +64,7 @@ namespace coop {
 
 namespace {
 
-constexpr uint32_t kProtocolVersion = 20;  // 20: world puzzles, ice bolts, signs (105, 108-111), gem sockets no longer shared; 19: the player's aim (mouse) in its state; 18: floor/road tiles, structure variants, everyone's familiars; 17: puzzle pieces by the host's
+constexpr uint32_t kProtocolVersion = 21;  // 21: world objects' health after shots and fire, their fire and poison (112); 20: world puzzles, ice bolts, signs (105, 108-111), gem sockets no longer shared; 19: the player's aim (mouse) in its state; 18: floor/road tiles, structure variants, everyone's familiars; 17: puzzle pieces by the host's
                                            // id and spot; 16: item unlocks; 15: a guest greets first (net.cpp); 14: the
                                            // tool swing
 constexpr uint32_t kYYVarImageBlend = 0x01AD8768;  // decompiled/code/yyvar_map.tsv
@@ -316,6 +316,7 @@ constexpr uint8_t kSharedTypes[] = {
     109,  // signs: a sign's text
     110,  // shots: what an ice bolt froze
     111,  // puzzles: a puzzle dig spot dug
+    112,  // sync: a world object started burning or poisoned
 };
 
 // Types only the host sends. One from a guest is a broken or hostile peer: the host drops it (it obeyed before - a
