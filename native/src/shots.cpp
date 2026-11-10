@@ -2,7 +2,8 @@
 
 #include <cmath>
 #include <cstring>
-#include <unordered_set>
+#include <initializer_list>
+#include <unordered_map>
 #include <vector>
 
 #include "MinHook.h"
@@ -25,6 +26,9 @@ constexpr int kObjArrow = 303, kObjFireball = 301;  // decompiled/data/objects.t
 // The ice rod's shot: the others saw no shot, only what it hit freeze (puzzles.cpp shares the frozen chests'
 // `freeze`). Enemies' ice bolts (the ice wizard's) are theirs, not a player's: FiredByLocalPlayer keeps them out.
 constexpr int kObjIceBolt = 308;
+// The death rod's shot (and the necro rod's upgrade): poison. Not copied before - the others saw nothing fly.
+constexpr int kObjVenomBolt = 302;
+constexpr int kParObject = 80;  // rocks, trees, structures (objects.tsv)
 // decompiled/code/yyvar_map.tsv
 constexpr uint32_t kYYVarDirection = 0x01AD87A0, kYYVarSpeed = 0x01AD8C10, kYYVarImageAngle = 0x01AD8728;
 // objFireball.owner: UseSword sets it to the player; Create_0 leaves noone. Its Step_0 starts with
@@ -48,6 +52,7 @@ constexpr uint32_t kHarmful[] = {
     0x01049800, 0x0104A020, 0x0104B5A0,              // objFireball Collision_80, _20, _271
     0x01067D50, 0x01069130, 0x01069890, 0x01069930,  // objIceBolt's five collisions (they freeze and hurt)
     0x0106A2C0,
+    0x0104EA40, 0x0104F110, 0x0104F730, 0x0104FC30,  // objVenomBolt's four collisions (the death rod's: poison)
 };
 constexpr size_t kHookCount = sizeof(kHarmful) / sizeof(kHarmful[0]);
 
@@ -72,14 +77,16 @@ struct BlastMsg {
 #pragma pack(pop)
 
 std::vector<int> g_fired;              // ours, made since the last step
-std::unordered_set<int> g_copies;      // other players' shots shown here
+std::unordered_map<int, net::PeerId> g_copies;  // other players' shots shown here, and whose
 int g_showing = 0;                     // inside our own instance_create of a copy
 yyc::EventFn g_orig[kHookCount] = {};
 yyc::ScriptFn g_origExplosionCreate = nullptr;
 
 int IdOf(yyc::CInstance* instance) { return static_cast<int>(yyc::GetBuiltinReal(instance, yyc::va::YYVar_id)); }
 
-bool IsShot(int object) { return object == kObjArrow || object == kObjFireball || object == kObjIceBolt; }
+bool IsShot(int object) {
+    return object == kObjArrow || object == kObjFireball || object == kObjIceBolt || object == kObjVenomBolt;
+}
 
 // The local player fired it: made in its own step or Use script (an enemy's fireball is made by the enemy).
 bool FiredByLocalPlayer(yyc::CInstance* self) {
@@ -88,41 +95,96 @@ bool FiredByLocalPlayer(yyc::CInstance* self) {
            !puppet::IsPuppet(self);
 }
 
+float FreezeOf(int id) {
+    yyc::RValue value{};
+    const bool number = yyc::GetVar(id, kSlotFreeze, &value) && yyc::IsNumber(value);
+    const float freeze = number ? static_cast<float>(yyc::ToReal(value)) : 0.f;
+    yyc::Free(&value);
+    return freeze;
+}
+
+// A world object or an enemy: what a shot stops at (not water, not a player).
+bool StopsShots(yyc::CInstance* self, yyc::CInstance* other) {
+    const int object = static_cast<int>(yyc::GetBuiltinReal(other, yyc::va::YYVar_object_index));
+    if (object == yyc::obj::player) return false;
+    for (const int parent : {kParObject, int(yyc::obj::parEnemy)}) {
+        if (object == parent) return true;
+        if (yyc::CallReal(self, "object_is_ancestor", {double(object), double(parent)}) != 0) return true;
+    }
+    return false;
+}
+
 template <size_t N>
 void __cdecl HarmfulHook(yyc::CInstance* self, yyc::CInstance* other) {
     if (!g_copies.empty() && g_copies.count(IdOf(self)) > 0) {
-        // An ice bolt's copy flew on through what the real one hit (a chest, a rock): it breaks there instead, its
-        // Destroy_0 only showing the shards. Not on a player: it starts on the shooter's puppet.
-        if (static_cast<int>(yyc::GetBuiltinReal(self, yyc::va::YYVar_object_index)) == kObjIceBolt && other != nullptr &&
+        // A copy hits nothing, so it flew on through what the real shot hit (a chest, a rock; the demon bow's arrows,
+        // playtest 2026-11-10): it ends there instead. An ice bolt's Destroy_0 only shows the shards; an arrow's drops
+        // the arrow item, and a venom bolt's is its own: those two go quietly. Not on a player: it starts on the
+        // shooter's puppet.
+        const int object = static_cast<int>(yyc::GetBuiltinReal(self, yyc::va::YYVar_object_index));
+        if (other != nullptr && object == kObjIceBolt &&
             static_cast<int>(yyc::GetBuiltinReal(other, yyc::va::YYVar_object_index)) != yyc::obj::player) {
             g_copies.erase(IdOf(self));
             yyc::CallReal(self, "instance_destroy", {double(IdOf(self))});
+        } else if (other != nullptr && (object == kObjArrow || object == kObjVenomBolt) && StopsShots(self, other)) {
+            g_copies.erase(IdOf(self));
+            yyc::CallReal(self, "instance_destroy", {double(IdOf(self)), 0});
         }
         return;
     }
+    // Our shot hit something: whatever ice it left (an ice bolt, an ice or demon bow's arrow) is put on it at the
+    // others too - the freeze worked at them, its ice was seen by the shooter only. Each side melts its own.
+    const int hit = other != nullptr ? IdOf(other) : 0;
+    const float before = hit != 0 ? FreezeOf(hit) : 0.f;
     g_orig[N](self, other);
-    // Our ice bolt hit something: the others put the same ice on it (each side melts its own).
-    if (other == nullptr || !net::IsConnected() ||
-        static_cast<int>(yyc::GetBuiltinReal(self, yyc::va::YYVar_object_index)) != kObjIceBolt) {
-        return;
-    }
+    if (hit == 0 || !net::IsConnected() || yyc::FindInstance(hit) == nullptr) return;
     const int object = static_cast<int>(yyc::GetBuiltinReal(other, yyc::va::YYVar_object_index));
     if (object == yyc::obj::player) return;
-    const int hit = IdOf(other);
-    yyc::RValue value{};
-    const float freeze = yyc::GetVar(hit, kSlotFreeze, &value) && yyc::IsNumber(value) ? static_cast<float>(yyc::ToReal(value)) : 0.f;
-    yyc::Free(&value);
-    if (!(freeze > 0)) return;
+    const float freeze = FreezeOf(hit);
+    if (!(freeze > 0) || freeze <= before) return;
     const FrozenMsg msg{sync::HostIdOf(hit), object, static_cast<float>(yyc::GetBuiltinReal(other, yyc::va::YYVar_x)),
                         static_cast<float>(yyc::GetBuiltinReal(other, yyc::va::YYVar_y)), freeze};
     net::Send(kFrozen, &msg, sizeof(msg));
 }
 
+// What a copy does as its shooter (decompiled index): its step and its drawing ask about "the player"'s gear
+// (objArrow Step_0: HasGear) - at the others that was their own, and the cosmic bow's purple, a demon bow's
+// look... were never seen there (playtest 2026-11-10). A copy's step and draw run with PlayerFind() its shooter.
+constexpr uint32_t kAsShooter[] = {
+    0x010525A0, 0x01059020,  // objArrow Step_0, Draw_0
+    0x010486E0, 0x0104BD70,  // objFireball Step_0, Draw_0
+    0x0104D970, 0x01050300,  // objVenomBolt Step_0, Draw_0
+    0x01067500, 0x0106A6F0,  // objIceBolt Step_0, Draw_0
+};
+constexpr size_t kAsShooterCount = sizeof(kAsShooter) / sizeof(kAsShooter[0]);
+yyc::EventFn g_origAsShooter[kAsShooterCount] = {};
+
+template <size_t N>
+void __cdecl AsShooterHook(yyc::CInstance* self, yyc::CInstance* other) {
+    const auto copy = g_copies.empty() ? g_copies.end() : g_copies.find(IdOf(self));
+    if (copy == g_copies.end()) {
+        g_origAsShooter[N](self, other);
+        return;
+    }
+    const net::PeerId shooter = copy->second;
+    puppet::BeginActing(shooter);
+    g_origAsShooter[N](self, other);
+    puppet::EndActing();
+}
+
+template <size_t... N>
+struct AsShooterTable {
+    static constexpr yyc::EventFn kHooks[] = {&AsShooterHook<N>...};
+};
+using AsShooterHooks = AsShooterTable<0, 1, 2, 3, 4, 5, 6, 7>;
+static_assert(sizeof(AsShooterHooks::kHooks) / sizeof(AsShooterHooks::kHooks[0]) == kAsShooterCount,
+              "one hook per event done as the shooter");
+
 template <size_t... N>
 struct HookTable {
     static constexpr yyc::EventFn kHooks[] = {&HarmfulHook<N>...};
 };
-using Hooks = HookTable<0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12>;
+using Hooks = HookTable<0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16>;
 static_assert(sizeof(Hooks::kHooks) / sizeof(Hooks::kHooks[0]) == kHookCount, "one hook per harmful event");
 
 ShotMsg Describe(yyc::CInstance* shot, int object) {
@@ -157,7 +219,7 @@ void Show(yyc::CInstance* self, net::PeerId from, const ShotMsg& msg) {
     --g_showing;
     yyc::CInstance* copy = yyc::FindInstance(id);
     if (copy == nullptr) return;
-    g_copies.insert(id);
+    g_copies[id] = from;
     // Its Create aimed it from our player: it flies as the shooter's did.
     yyc::SetBuiltinReal(copy, kYYVarDirection, msg.direction);
     yyc::SetBuiltinReal(copy, kYYVarSpeed, msg.speed);
@@ -179,16 +241,17 @@ void Show(yyc::CInstance* self, net::PeerId from, const ShotMsg& msg) {
     }
     // Shots end by themselves (lifetime, outside the room): forget the ids that are gone.
     for (auto it = g_copies.begin(); it != g_copies.end();) {
-        it = yyc::FindInstance(*it) == nullptr ? g_copies.erase(it) : std::next(it);
+        it = yyc::FindInstance(it->first) == nullptr ? g_copies.erase(it) : std::next(it);
     }
 }
 
-// One of our own fireballs went off: the others see its blast too (and lose their copy of it there).
+// One of our own shots went off - a fireball, a void bow's arrow (playtest 2026-11-10: its blast was the shooter's
+// alone), a venom bolt: the others see its blast too (and lose their copy of it there).
 yyc::RValue* __cdecl ExplosionCreateHook(yyc::CInstance* self, yyc::CInstance* other, yyc::RValue* result, int argc,
                                          yyc::RValue** args) {
     yyc::RValue* r = g_origExplosionCreate(self, other, result, argc, args);
     if (self == nullptr || !net::IsConnected() || argc < 2 || args == nullptr) return r;
-    if (static_cast<int>(yyc::GetBuiltinReal(self, yyc::va::YYVar_object_index)) != kObjFireball) return r;
+    if (!IsShot(static_cast<int>(yyc::GetBuiltinReal(self, yyc::va::YYVar_object_index)))) return r;
     if (g_copies.count(IdOf(self)) > 0) return r;  // a copy never collides; to be safe all the same
     BlastMsg msg{};
     for (int i = 0; i < kBlastArgs; ++i) {
@@ -200,24 +263,23 @@ yyc::RValue* __cdecl ExplosionCreateHook(yyc::CInstance* self, yyc::CInstance* o
     return r;
 }
 
-// Another player's fireball went off: its copy here (the nearest) goes, and the same blast shows - harmless: it is
+// Another player's shot went off: its copy here (the nearest) goes, and the same blast shows - harmless: it is
 // the shooter's blast that breaks and hurts, at the shooter's side (bombs.cpp makes it so).
 void ShowBlast(yyc::CInstance* self, const BlastMsg& msg) {
     const float x = msg.args[0], y = msg.args[1];
     int nearest = 0;
     double best = double(kBlastMatchDistance) * kBlastMatchDistance;
     for (auto it = g_copies.begin(); it != g_copies.end();) {
-        yyc::CInstance* copy = yyc::FindInstance(*it);
+        yyc::CInstance* copy = yyc::FindInstance(it->first);
         if (copy == nullptr) {
             it = g_copies.erase(it);
             continue;
         }
         const double dx = yyc::GetBuiltinReal(copy, yyc::va::YYVar_x) - x;
         const double dy = yyc::GetBuiltinReal(copy, yyc::va::YYVar_y) - y;
-        if (static_cast<int>(yyc::GetBuiltinReal(copy, yyc::va::YYVar_object_index)) == kObjFireball &&
-            dx * dx + dy * dy <= best) {
+        if (dx * dx + dy * dy <= best) {  // any shot: a fireball's, or a void bow's arrow's blast
             best = dx * dx + dy * dy;
-            nearest = *it;
+            nearest = it->first;
         }
         ++it;
     }
@@ -245,6 +307,10 @@ bool InstallHooks() {
     for (size_t i = 0; i < kHookCount; ++i) {
         ok = MH_CreateHook(yyc::At<void*>(kHarmful[i]), reinterpret_cast<void*>(Hooks::kHooks[i]),
                            reinterpret_cast<void**>(&g_orig[i])) == MH_OK && ok;
+    }
+    for (size_t i = 0; i < kAsShooterCount; ++i) {
+        ok = MH_CreateHook(yyc::At<void*>(kAsShooter[i]), reinterpret_cast<void*>(AsShooterHooks::kHooks[i]),
+                           reinterpret_cast<void**>(&g_origAsShooter[i])) == MH_OK && ok;
     }
     ok = MH_CreateHook(yyc::At<void*>(kScriptExplosionCreate), reinterpret_cast<void*>(&ExplosionCreateHook),
                        reinterpret_cast<void**>(&g_origExplosionCreate)) == MH_OK && ok;
