@@ -26,6 +26,36 @@ struct Swing {
 // The local player's swing now.
 Swing ReadSwing(yyc::CInstance* player);
 
+// objPlayer variables its Draw_0 draws from that only its Step_0/Step_2 work out (var_slots.tsv): a puppet runs
+// neither, so they come from its player. The thunder rod's bolt (shootingThunder, and the bolt's three points in
+// the arrays thunderRodX/Y: the others never saw it), a rod's charge (rodCharge[item], per rod), a bow drawn.
+struct Drawn {
+    int slot;
+    int index;  // into an array; kWhole: not an array, kInHand: at the item in hand
+};
+constexpr int kWhole = -1, kInHand = -2;
+constexpr Drawn kDrawnSlots[] = {
+    {0x7AB, kWhole},   // shootingThunder
+    {0x87A, 0},        // thunderRodX[0..2]
+    {0x87A, 1},
+    {0x87A, 2},
+    {0x87B, 0},        // thunderRodY[0..2]
+    {0x87B, 1},
+    {0x87B, 2},
+    {0x56A, kWhole},   // hitScanX
+    {0x56B, kWhole},   // hitScanY
+    {0x757, kInHand},  // rodCharge[the rod in hand]
+    {0x636, kWhole},   // maxRodCharge
+    {0xCF, kWhole},    // bowCharge
+};
+constexpr size_t kDrawnCount = sizeof(kDrawnSlots) / sizeof(kDrawnSlots[0]);
+
+// kDrawnSlots[i] of player instance `id` holding `tool` (an array's element only when the array is that long: GML stops
+// the game on an index past an array's end - rodCharge[] is not as long as the item list). False if there is none.
+bool ReadDrawn(int id, size_t i, int tool, float* out);
+// Sets it, under the same conditions.
+void WriteDrawn(int id, size_t i, int tool, float value);
+
 struct State {
     float x, y;
     float imageIndex, xscale, yscale, depth;
@@ -39,6 +69,7 @@ struct State {
     // Where the player's mouse is (room coordinates): objPlayer's Draw_0 points the tool in hand at mouse_x/mouse_y
     // (the swords, the bows), so a puppet's tool followed the local player's mouse. NaN: not known.
     float aimX = NAN, aimY = NAN;
+    float drawn[kDrawnCount] = {NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN};  // NaN: not known
 };
 
 using LocalStepFn = void (*)(yyc::CInstance* localPlayer);

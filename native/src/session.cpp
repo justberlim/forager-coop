@@ -111,6 +111,7 @@ struct PlayerStateMsg {
     puppet::Swing swing;  // the biggest since the last update: a hit lasts a step, updates come every few
     int32_t blend;  // image_blend: the rainbow body's colours, made in the player's Step_2 (puppets have none)
     float aimX, aimY;  // mouse_x/mouse_y (room): where its puppet's tool points (swords, bows)
+    float drawn[puppet::kDrawnCount];  // puppet::kDrawnSlots: what its Draw_0 needs from its Step (a rod's bolt)
 };
 struct PeerStateMsg {
     uint8_t player;
@@ -200,6 +201,9 @@ PlayerStateMsg CaptureState(yyc::CInstance* player) {
     }
     s.aimX = aimX;
     s.aimY = aimY;
+    for (size_t i = 0; i < puppet::kDrawnCount; ++i) {
+        if (!puppet::ReadDrawn(id, i, s.tool, &s.drawn[i])) s.drawn[i] = NAN;
+    }
     yyc::Free(&tool);
     return s;
 }
@@ -781,6 +785,7 @@ void Tick(yyc::CInstance* localPlayer) {
         target.blend = remote.blend;
         target.aimX = remote.aimX;
         target.aimY = remote.aimY;
+        memcpy(target.drawn, remote.drawn, sizeof(target.drawn));
         puppet::Update(localPlayer, player, target);
     }
 }

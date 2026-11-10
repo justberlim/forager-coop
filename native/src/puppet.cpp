@@ -632,6 +632,49 @@ void RefreshCosmetics(const Puppet& puppet) {
     yyc::Free(&result);
 }
 
+namespace {
+
+// The array index of kDrawnSlots[i] in instance `id` (kNoArrayIndex: not an array); false if it has no such element.
+bool DrawnElement(int id, size_t i, int tool, int* index) {
+    const Drawn& drawn = kDrawnSlots[i];
+    yyc::RValue value{};
+    const bool has = yyc::GetVar(id, drawn.slot, &value);
+    bool ok = false;
+    if (has && drawn.index == kWhole) {
+        ok = yyc::IsNumber(value);
+        *index = yyc::kNoArrayIndex;
+    } else if (has && (value.kind & yyc::kKindMask) == yyc::kArray) {
+        *index = drawn.index == kInHand ? tool : drawn.index;
+        yyc::RValue length{};
+        yyc::CInstance* self = yyc::FindInstance(id);
+        if (*index >= 0 && self != nullptr && yyc::CallBuiltin("array_length_1d", self, 1, &value, &length)) {
+            ok = *index < static_cast<int>(yyc::ToReal(length));
+        }
+        yyc::Free(&length);
+    }
+    yyc::Free(&value);
+    return ok;
+}
+
+}  // namespace
+
+bool ReadDrawn(int id, size_t i, int tool, float* out) {
+    int index = 0;
+    if (i >= kDrawnCount || !DrawnElement(id, i, tool, &index)) return false;
+    yyc::RValue value{};
+    const bool ok = yyc::GetVarAt(id, kDrawnSlots[i].slot, index, &value) && yyc::IsNumber(value);
+    if (ok) *out = static_cast<float>(yyc::ToReal(value));
+    yyc::Free(&value);
+    return ok;
+}
+
+void WriteDrawn(int id, size_t i, int tool, float value) {
+    int index = 0;
+    if (i >= kDrawnCount || !DrawnElement(id, i, tool, &index)) return;
+    yyc::RValue v = yyc::Real(value);
+    yyc::SetVarAt(id, kDrawnSlots[i].slot, index, &v);
+}
+
 void Update(yyc::CInstance* localPlayer, net::PeerId player, const State& target) {
     Prune();
     Puppet* puppet = Find(player);
@@ -669,6 +712,9 @@ void Update(yyc::CInstance* localPlayer, net::PeerId player, const State& target
             puppet->aimY += ay * kFollow;
         }
         puppet->hasAim = true;
+    }
+    for (size_t i = 0; i < kDrawnCount; ++i) {
+        if (std::isfinite(target.drawn[i])) WriteDrawn(puppet->id, i, target.tool, target.drawn[i]);
     }
     puppet->name.assign(target.name, strnlen(target.name, sizeof(target.name)));
     puppet->hp = target.hp;
