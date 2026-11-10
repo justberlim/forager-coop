@@ -284,12 +284,39 @@ void SendRestingPlaces(yyc::CInstance* self) {
     g_spots = std::move(seen);
 }
 
+// Guest: a chest on its way to where it came to rest at the host. It slid off something here its own way and was
+// put there at once: a puzzle's chest landed in one place and jumped to another (playtest 2026-11-10). It stops
+// sliding here and glides there over a few steps.
+struct Glide {
+    int id;
+    double x, y;
+    int steps;
+};
+std::vector<Glide> g_glides;
+constexpr int kGlideSteps = 18;
+
+void GlideChests() {
+    for (auto it = g_glides.begin(); it != g_glides.end();) {
+        yyc::CInstance* chest = yyc::FindInstance(it->id);
+        if (chest == nullptr) {
+            it = g_glides.erase(it);
+            continue;
+        }
+        const double x = yyc::GetBuiltinReal(chest, yyc::va::YYVar_x), y = yyc::GetBuiltinReal(chest, yyc::va::YYVar_y);
+        const double share = 1.0 / it->steps;  // of what is left: it is there at the last step
+        yyc::SetBuiltinReal(chest, yyc::va::YYVar_x, x + (it->x - x) * share);
+        yyc::SetBuiltinReal(chest, yyc::va::YYVar_y, y + (it->y - y) * share);
+        it = --it->steps <= 0 ? g_glides.erase(it) : std::next(it);
+    }
+}
+
 void ApplyMove(yyc::CInstance* self, const ChestMoveMsg& msg) {
     const int local = sync::Resolve(self, msg.hostId, msg.object, msg.fromX, msg.fromY);
     yyc::CInstance* chest = local != 0 ? yyc::FindInstance(local) : nullptr;
     if (chest == nullptr) return;
-    yyc::SetBuiltinReal(chest, yyc::va::YYVar_x, msg.x);
-    yyc::SetBuiltinReal(chest, yyc::va::YYVar_y, msg.y);
+    g_glides.erase(std::remove_if(g_glides.begin(), g_glides.end(), [local](const Glide& g) { return g.id == local; }),
+                   g_glides.end());
+    g_glides.push_back({local, msg.x, msg.y, kGlideSteps});
     yyc::RValue grounded = yyc::Real(1);
     yyc::SetVar(local, kSlotGrounded, &grounded);
     Log("chests: chest %d moved to (%.0f, %.0f) as at the host", msg.object, msg.x, msg.y);
@@ -307,6 +334,7 @@ bool Read(const net::Message& message, T* out) {
 bool IsTreasureChest(int object) { return object >= kFirstChest && object <= kLastChest; }
 
 void Tick(yyc::CInstance* localPlayer) {
+    if (!g_glides.empty()) GlideChests();
     if (!net::IsConnected() || ++g_steps % kEverySteps != 0) return;
     if (IsHost()) SendRestingPlaces(localPlayer);
 }
@@ -415,6 +443,7 @@ void Reset() {
     g_keys.clear();
     g_keyChests.clear();
     g_spots.clear();
+    g_glides.clear();
     g_steps = 0;
     g_opening = false;
 }
