@@ -8,6 +8,7 @@
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "MinHook.h"
@@ -54,9 +55,13 @@ struct MobState {
     float xscale;
     float hp;  // so the replica's health bar shows the guest's hits (which land on the host)
     float alpha;  // a bone pile's skeleton fades in (Create: 0, its step raises it): replicas stayed unseen
+    // An ice sword's or rod's freeze, a fire's burn, a poison: drawn on the enemy, at the hitter only (playtest
+    // 2026-11-10: an enemy frozen for both, its ice seen by the one who froze it). Each counts down by itself.
+    float freeze, burn, poison;
 };
 #pragma pack(pop)
 constexpr int kSlotHp = yyc::slot::hp;
+constexpr int kSlotFreeze = 0x443, kSlotBurn = 0xD7, kSlotPoison = 0x704;  // var_slots.tsv
 constexpr uint32_t kYYVarImageAlpha = 0x01AD8790;  // decompiled/code/yyvar_map.tsv
 
 bool (*g_isHost)() = nullptr;
@@ -367,6 +372,12 @@ MobState Capture(yyc::CInstance* mob, int id) {
     yyc::GetVar(id, kSlotHp, &hp);
     s.hp = static_cast<float>(yyc::ToReal(hp));
     yyc::Free(&hp);
+    const std::pair<int, float*> status[] = {{kSlotFreeze, &s.freeze}, {kSlotBurn, &s.burn}, {kSlotPoison, &s.poison}};
+    for (const auto& [slot, field] : status) {
+        yyc::RValue value{};
+        *field = yyc::GetVar(id, slot, &value) && yyc::IsNumber(value) ? static_cast<float>(yyc::ToReal(value)) : 0.f;
+        yyc::Free(&value);
+    }
     return s;
 }
 
@@ -400,7 +411,20 @@ void Follow(yyc::CInstance* mob, const MobState& s) {
     yyc::SetBuiltinReal(mob, yyc::va::YYVar_image_xscale, s.xscale);
     if (s.alpha >= 0 && s.alpha <= 1) yyc::SetBuiltinReal(mob, kYYVarImageAlpha, s.alpha);
     const int id = static_cast<int>(yyc::GetBuiltinReal(mob, yyc::va::YYVar_id));
-    if (const auto set = g_hpSet.find(id); set != g_hpSet.end()) {
+    // The host's freeze, burn and poison, shown here (only a variable the replica has; never NaN). Health lost here to
+    // a burn or poison is the host's to take: it comes with the next update, not as damage of ours.
+    bool burning = false;
+    const std::pair<int, float> status[] = {{kSlotFreeze, s.freeze}, {kSlotBurn, s.burn}, {kSlotPoison, s.poison}};
+    for (const auto& [slot, value] : status) {
+        yyc::RValue now{};
+        const bool has = yyc::GetVar(id, slot, &now) && yyc::IsNumber(now);
+        yyc::Free(&now);
+        if (!has || !std::isfinite(value) || value < 0 || value > 100000) continue;
+        yyc::RValue v = yyc::Real(value);
+        yyc::SetVar(id, slot, &v);
+        if (slot != kSlotFreeze && value > 0) burning = true;
+    }
+    if (const auto set = g_hpSet.find(id); set != g_hpSet.end() && !burning) {
         yyc::RValue now{};
         if (yyc::GetVar(id, kSlotHp, &now) && yyc::IsNumber(now) && yyc::ToReal(now) < set->second - kNoticedDamage) {
             sync::SendDamage(id, set->second - static_cast<float>(yyc::ToReal(now)));
