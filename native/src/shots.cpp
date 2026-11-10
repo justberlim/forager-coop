@@ -31,6 +31,7 @@ constexpr uint32_t kYYVarDirection = 0x01AD87A0, kYYVarSpeed = 0x01AD8C10, kYYVa
 // `if (!instance_exists(owner)) { instance_destroy(); exit }` - a copy (no owner) was gone at its first step, so the
 // sword's fireballs were never seen by the other players.
 constexpr int kSlotFireballOwner = 0x6CA;
+constexpr int kSlotArrowDontFollow = 0x19C;  // objArrow.dontFollow (var_slots.tsv)
 // ExplosionCreate(x, y, range, dmgPlayer) makes the objExplosion of a fireball's hit (its collision events call it;
 // bombs make theirs themselves, bombs.cpp) and returns nothing. A copy hits nothing, so the other players saw no blast.
 constexpr uint32_t kScriptExplosionCreate = 0x0086D1E0;
@@ -164,6 +165,12 @@ void Show(yyc::CInstance* self, net::PeerId from, const ShotMsg& msg) {
     yyc::SetBuiltinReal(copy, yyc::va::YYVar_image_xscale, msg.xscale);
     yyc::SetBuiltinReal(copy, yyc::va::YYVar_image_yscale, msg.yscale);
     if (msg.sprite >= 0) yyc::SetBuiltinReal(copy, yyc::va::YYVar_sprite_index, msg.sprite);
+    if (msg.object == kObjArrow) {
+        // The camera follows a flying arrow (objArrow.dontFollow, 0 from its Create): it went after the copy of the
+        // other player's arrow too (playtest 2026-11-10). Only the shooter's own view follows it.
+        yyc::RValue dontFollow = yyc::Real(1);
+        yyc::SetVar(id, kSlotArrowDontFollow, &dontFollow);
+    }
     if (msg.object == kObjFireball) {
         // The shooter's puppet owns it (a guest hears every shot from the host: then the host's); any player does.
         yyc::CInstance* shooter = puppet::Instance(from);
