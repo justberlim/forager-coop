@@ -256,6 +256,33 @@ std::unordered_set<int> g_localDrops;  // guest: crafted here, the host never kn
 
 void DestroySilently(yyc::CInstance* self, int id);
 
+// Drops on the ground before the session (the save's) are no replica of anything: a player's pickup is told by spot,
+// and a drop flies to its collector first - its end was told where the player stood, no drop was there at the other
+// side, and both players got it (playtest 2026-11-10: the host's drops doubled once a guest came). Where each drop
+// lay is noted while it lies there; its end is told at that spot.
+constexpr unsigned kDropSpotsEverySteps = 30;
+std::unordered_map<int, std::pair<double, double>> g_dropSpots;  // local id -> where it lay when first seen
+
+void NoteDropSpots(yyc::CInstance* self) {
+    if (g_steps % kDropSpotsEverySteps != 0) return;
+    const int count = static_cast<int>(CallReal(self, "instance_number", {double(kParResource)}));
+    for (int i = 0; i < count; ++i) {
+        const int id = static_cast<int>(CallReal(self, "instance_find", {double(kParResource), double(i)}));
+        yyc::CInstance* drop = yyc::FindInstance(id);
+        if (drop == nullptr || g_dropSpots.count(id) > 0) continue;
+        g_dropSpots[id] = {yyc::GetBuiltinReal(drop, yyc::va::YYVar_x), yyc::GetBuiltinReal(drop, yyc::va::YYVar_y)};
+    }
+}
+
+// `info` of a drop that is going: at the spot it lay (see g_dropSpots).
+void AtDropSpot(InstanceInfo* info) {
+    const auto spot = g_dropSpots.find(info->id);
+    if (spot == g_dropSpots.end()) return;
+    info->x = spot->second.first;
+    info->y = spot->second.second;
+    g_dropSpots.erase(spot);
+}
+
 void FlushSpawns(yyc::CInstance* self) {
     for (const int id : g_pendingSpawns) {
         // Whatever it turns out to be, its entry goes now: one kept for anything but a delivered drop (a guest's
@@ -501,6 +528,7 @@ void __cdecl DestroyHook(yyc::CInstance* self, yyc::CInstance* other, int id, in
     if (report) {
         info = Describe(target);
         synced = IsSynced(self, info.object);
+        if (synced && IsDrop(self, info.object)) AtDropSpot(&info);
     }
     // XP and rewards from destroying something a guest hit go to that guest (PlayerFind -> its puppet).
     net::PeerId hitter = net::kHostPeer;
@@ -914,6 +942,7 @@ void Tick(yyc::CInstance* localPlayer) {
     if (IsGuest()) SendScrollSpawners();
     if (IsGuest()) SendBuiltStructures();
     WatchHits(localPlayer);
+    if (Connected()) NoteDropSpots(localPlayer);
     if (++g_steps % kStatsEverySteps == 0) {
         Log("sync: sent spawn %u destroy %u hit %u gone %u | applied spawn %u destroy %u hit %u gone %u",
             g_sent[kSpawn], g_sent[kDestroy], g_sent[kHit], g_sent[kGuestDestroyed], g_applied[kSpawn],
@@ -1048,6 +1077,7 @@ void Reset() {
     g_replayLost.clear();
     g_guestDrops.clear();
     g_hostOwnedDrops.clear();
+    g_dropSpots.clear();
     g_pendingSpawns.clear();
     g_pendingDestroys.clear();
     g_craftedDrops.clear();
