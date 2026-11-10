@@ -889,6 +889,7 @@ void Leave() {
     signs::Reset();
     dungeons::Reset();
     puzzles::Reset();
+    puzzles::ForgetSession();
     commands::Reset();
     g_deferred.clear();
     g_lastSharedRoom = -1;
