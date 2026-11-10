@@ -4,12 +4,14 @@
 #include "sync.h"
 #include "sync_internal.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include "interiors.h"
 #include "log.h"
 #include "mobs.h"
 #include "puppet.h"
@@ -43,6 +45,34 @@ using EventUserFn = void(__cdecl*)(yyc::CInstance* self, yyc::CInstance* other, 
 EventUserFn g_origEventUser = nullptr;
 yyc::ScriptFn g_origRepairKit = nullptr;
 std::unordered_map<int, net::PeerId> g_hitByGuest;  // host: instances a guest hit last, and which guest
+
+// ---- Damage that is no tool hit ----
+// Shots (arrows, rods' bolts and fireballs), explosions and fire take an object's health in their own events, at the
+// player whose shot it was: the others saw the object whole, and hitting it they started from full health (a rod
+// had brought it low at the other player). Fire is `burn` (parObject Step_0: counts down, takes health while above
+// 0 and draws FireEffect), poison `poison` the same: only the shooter saw a tree burn.
+// Each side looks at the world objects around it every few steps: the host tells any change of health (as after a
+// tool hit) and a fire or poison started; a guest sends the health its own shot took (as a hit, the host does it) and
+// a fire or poison it started (the host's object then burns, and its health comes back from the host). A guest's
+// copy burns too, to show it: health lost to that is not sent, the host's comes instead.
+constexpr uint8_t kObjectStatus = 112;  // either way (the host passes a guest's on): StatusMsg
+constexpr int kSlotBurn = 0xD7;
+constexpr int kSlotPoison = 0x704;
+constexpr int kParObject = 80;
+constexpr unsigned kWatchEverySteps = 6;
+#pragma pack(push, 1)
+struct StatusMsg {
+    int32_t hostId;  // the host's id (-1 if the sender has none bound: then by object and spot)
+    int32_t object;
+    float x, y;
+    float burn, poison;  // what it was set to here (both count down at every player by themselves)
+};
+#pragma pack(pop)
+struct Seen {
+    float hp, burn, poison;
+};
+std::unordered_map<int, Seen> g_seen;  // local id -> as last looked at, sent or applied
+unsigned g_watchSteps = 0;
 
 using yyc::CallReal;
 using yyc::StackFrame;
@@ -89,6 +119,7 @@ void SendHp(yyc::CInstance* target, uint8_t hitter = kNoHitter) {
                     ReadVar(info.id, kSlotHp), ReadVar(info.id, kSlotHpAlpha), ReadVar(info.id, kSlotHpLast),
                     ReadVar(info.id, kSlotHpWhite), hitter};
     net::Send(kObjectHp, &msg, sizeof(msg));
+    if (const auto seen = g_seen.find(info.id); seen != g_seen.end()) seen->second.hp = msg.hp;
 }
 
 void ApplyHp(yyc::CInstance* self, const HpMsg& msg) {
@@ -105,6 +136,7 @@ void ApplyHp(yyc::CInstance* self, const HpMsg& msg) {
         yyc::SetVar(local, slots[i], &v);
     }
     mobs::NoteHostHp(local, msg.hp);
+    if (const auto seen = g_seen.find(local); seen != g_seen.end()) seen->second.hp = msg.hp;  // not ours to send
 }
 
 // Guest: a tool hit goes to the host with the guest's own damage (the puppet's would be used there otherwise).
@@ -239,6 +271,81 @@ void ApplyHit(yyc::CInstance* self, net::PeerId from, const ObjectMsg& msg, bool
     SendHp(yyc::FindInstance(targetId), from);  // gone if the hit destroyed it
 }
 
+void SendStatus(yyc::CInstance* target, float burn, float poison) {
+    const InstanceInfo info = Describe(target);
+    const StatusMsg msg{HostIdOf(info.id), info.object, static_cast<float>(info.x), static_cast<float>(info.y), burn,
+                        poison};
+    net::Send(kObjectStatus, &msg, sizeof(msg));
+}
+
+bool ReadNumber(int id, int slot, float* out) {
+    yyc::RValue value{};
+    const bool number = yyc::GetVar(id, slot, &value) && yyc::IsNumber(value);
+    if (number) *out = static_cast<float>(yyc::ToReal(value));
+    yyc::Free(&value);
+    return number;
+}
+
+// Every few steps: the world objects here whose health went down, or that started burning or poisoned, since the
+// last look (see g_seen). Enemies and critters are mobs.cpp's.
+void WatchObjects(yyc::CInstance* self) {
+    if (!Connected() || ++g_watchSteps % kWatchEverySteps != 0) return;
+    const int count = static_cast<int>(CallReal(self, "instance_number", {double(kParObject)}));
+    for (int i = 0; i < count; ++i) {
+        const int id = static_cast<int>(CallReal(self, "instance_find", {double(kParObject), double(i)}));
+        yyc::CInstance* target = yyc::FindInstance(id);
+        if (target == nullptr || interiors::IsInterior(id)) continue;
+        const int object = static_cast<int>(yyc::GetBuiltinReal(target, yyc::va::YYVar_object_index));
+        float hp = 0, burn = 0, poison = 0;
+        if (!ReadNumber(id, kSlotHp, &hp)) continue;
+        ReadNumber(id, kSlotBurn, &burn);
+        ReadNumber(id, kSlotPoison, &poison);
+        const auto found = g_seen.find(id);
+        if (found == g_seen.end()) {
+            if (!IsMob(self, object)) g_seen[id] = {hp, burn, poison};
+            continue;
+        }
+        Seen& seen = found->second;
+        // Both count down: a rise is a new fire or poison.
+        const bool started = burn > seen.burn + 0.5f || poison > seen.poison + 0.5f;
+        if (started) SendStatus(target, burn, poison);
+        if (IsHost() && hp != seen.hp) {
+            SendHp(target);  // no hitter: no hit shown, the health bar only
+        } else if (IsGuest() && hp < seen.hp && !(burn > 0) && !(poison > 0)) {
+            // Our own shot's: the host does it as our hit and tells the health back. By host id or, as a tool hit, by
+            // spot (an object from the save may not be bound yet: SendDamage wants a host id).
+            const InstanceInfo info = Describe(target);
+            ObjectMsg msg{HostIdOf(id), info.object, static_cast<float>(info.x), static_cast<float>(info.y),
+                          seen.hp - hp, kNoItem, kOwnerAnyone, -1, 0};
+            if (net::Send(kHit, &msg, sizeof(msg))) ++g_sent[kHit];
+            Log("sync: own shot's damage %.1f to object %d at (%.0f, %.0f) sent to the host", msg.depth, info.object,
+                info.x, info.y);
+        }
+        seen = {hp, burn, poison};
+    }
+}
+
+void ApplyStatus(yyc::CInstance* self, const StatusMsg& msg) {
+    if (!std::isfinite(msg.x) || !std::isfinite(msg.y) || !std::isfinite(msg.burn) || !std::isfinite(msg.poison) ||
+        msg.burn < 0 || msg.poison < 0 || msg.burn > 100000 || msg.poison > 100000 || !IsSynced(self, msg.object)) {
+        return;
+    }
+    const int local = Resolve(self, msg.hostId, msg.object, msg.x, msg.y);
+    if (local == 0) return;
+    const int slots[2] = {kSlotBurn, kSlotPoison};
+    const float values[2] = {msg.burn, msg.poison};
+    for (int i = 0; i < 2; ++i) {
+        float now = 0;
+        if (!ReadNumber(local, slots[i], &now) || now >= values[i]) continue;  // never a variable it has not got
+        yyc::RValue v = yyc::Real(values[i]);
+        yyc::SetVar(local, slots[i], &v);
+    }
+    if (const auto seen = g_seen.find(local); seen != g_seen.end()) {  // not news to send back
+        seen->second.burn = (std::max)(seen->second.burn, msg.burn);
+        seen->second.poison = (std::max)(seen->second.poison, msg.poison);
+    }
+}
+
 }  // namespace
 
 namespace internal {
@@ -257,8 +364,18 @@ bool InstallHitHooks() {
     return ok;
 }
 
+void WatchHits(yyc::CInstance* localPlayer) { WatchObjects(localPlayer); }
+
 bool HandleHits(const net::Message& message, yyc::CInstance* localPlayer) {
     const size_t size = message.payload.size();
+    if (message.type == kObjectStatus) {
+        if (size == sizeof(StatusMsg)) {
+            StatusMsg msg{};
+            memcpy(&msg, message.payload.data(), sizeof(msg));
+            ApplyStatus(localPlayer, msg);
+        }
+        return true;
+    }
     if (message.type == kHit) {
         if (size == sizeof(ObjectMsg) && IsHost()) {
             ObjectMsg msg{};
@@ -289,7 +406,11 @@ bool TakeGuestHitter(int id, net::PeerId* guest) {
     return true;
 }
 
-void ForgetHits() { g_hitByGuest.clear(); }
+void ForgetHits() {
+    g_hitByGuest.clear();
+    g_seen.clear();
+    g_watchSteps = 0;
+}
 
 void SendDamage(int localId, float amount) {
     yyc::CInstance* target = yyc::FindInstance(localId);
